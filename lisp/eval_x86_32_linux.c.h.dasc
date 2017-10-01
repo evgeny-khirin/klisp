@@ -1,0 +1,1896 @@
+// -*- mode: C++; -*-
+
+#ifndef linux
+#error Linux OS required to compile this file
+#endif // linux
+
+#ifndef __i386__
+#error X86 CPU architecture required to compile this file
+#endif
+
+//==============================================================================
+// include DynASM
+//==============================================================================
+#include "my_dasm.h"
+
+//==============================================================================
+// configure DynAsm
+//==============================================================================
+| .arch x86;
+| .section prolog, body, epilog, unliked;
+| .actionlist g_dasm_actionlist;
+| .globals DASM_GLOB_;
+
+//==============================================================================
+// Stack frame schema:
+//   [ebp +  16] - third argument - used in unwind_callback only - %EDI.
+//   [ebp +  12] - second argument - args pointer or %ESI for unwind_callback
+//   [ebp +  8] - first argument - nargs or %EBX for unwind_callback
+//   [ebp +  4] - return addres
+//   [ebp +  0] - saved ebp
+//   [ebp -  4] - pointer to function_t of current function
+//   [%ESI] - if function has arguments, then %ESI is saved
+//   [%EDI] - if function has local variables, then %EDI is saved
+//   [local vairables] - local variables from LET and #:ALLOCA special forms.
+//   [parameters] - if function accepts optional, rest or keywords arguments
+//       then place for them are allocated on stack. All supplied arguments are
+//       copied to stack frame. Missed optional and keyword arguments are
+//       evaluated according to their default values. Rest argument is also
+//       constructed and stored on stack.
+//   [temporary variables] - variabless allocated by code generator in order to
+//       store intermediate results.
+//   [call frame] - parameters for directly calling functions. Size of
+//       call frame calculated during compilation and has space enough to store
+//       all parameters for all functions called directly from compiling
+//       function. For example, in case of (lambda () (f 1 (g 2 3 (h 4 5))))
+//       size of call frame will be 5. This allows to allocate space once only
+//       and doesn't allocate and free frames for each calling function.
+//   [space for C arguments] - space for C arguments of Lisp functions:
+//       typedef term (*lisp_fun_t)(long nargs, const term * args);
+//       And for arguments of C helper functions.
+//       Defined as C_ARGS_RESERVED below.
+//==============================================================================
+
+//==============================================================================
+// Space on stack reserved for calling Lisp and C helpers functions
+//==============================================================================
+#define C_ARGS_RESERVED   5
+
+//==============================================================================
+// Registers usage:
+// %EAX - clobbered register, function return value
+// %EBP - stack frame pointer, for backtrace only
+// %EBX - function environment, if function is closure
+// %ESI - pointer to function arguments
+// %EDI - pointer to local variables
+// %ESP - pointer to begining of call frame
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// internal function
+// generates closure trampoline code
+//------------------------------------------------------------------------------
+static term gen_closure_trampoline(function_t * fn, const function_t * enclosed, closure_env_t * env) {
+  dasm_State * dstate;
+  Dst_DECL = &dstate;
+  dasm_init(Dst, DASM_MAXSECTION);
+  //  void* global_labels[DASM_GLOB__MAX];
+  //  dasm_setupglobal(Dst, global_labels, DASM_GLOB__MAX);
+  dasm_setup(Dst, g_dasm_actionlist);
+  | .body;
+  if (enclosed->closure_type == 0) {
+    | mov eax, env;
+  } else {
+    | mov eax, fn;
+  }
+  | jmp &enclosed->bcode;
+  my_dasm_finish(Dst, fn, NULL);
+  return __pointer_to_term(fn);
+}
+
+//------------------------------------------------------------------------------
+// internal function
+// creates closures for functions, that evaluate lambda list's optional and
+// keyword arguments
+//------------------------------------------------------------------------------
+static term make_ll_closure(const function_t * enclosed, closure_env_t * env) {
+  function_t * fn = (function_t *)lisp_alloc(sizeof(function_t), NULL);
+  __closure_init(fn, enclosed, env);
+  return gen_closure_trampoline(fn, enclosed, env);
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static term make_closure(const function_t * enclosed, closure_env_t * env) {
+  function_t * fn = (function_t *)lisp_alloc(sizeof(function_t), NULL);
+  __closure_init(fn, enclosed, env);
+  long i;
+  for (i = 0; i < fn->nopt_args; ++i) {
+    if (!is_lambda(fn->opt_arg_funs[i])) {
+      break;
+    }
+  }
+  if (i < fn->nopt_args) {
+    fn->opt_arg_funs = (term *)lisp_alloc(sizeof(term) * fn->nopt_args, NULL);
+    for (i = 0; i < fn->nopt_args; ++i) {
+      term ll_fn = enclosed->opt_arg_funs[i];
+      if (is_lambda(ll_fn)) {
+        fn->opt_arg_funs[i] = ll_fn;
+      } else if (!eq(car(ll_fn), g_make_closure)) {
+        SIGNAL_INTERNAL_ERROR();
+      } else {
+        fn->opt_arg_funs[i] = make_ll_closure(term_to_lambda(cadr(ll_fn)), env);
+      }
+    }
+  }
+  for (i = 0; i < fn->nkey_args; ++i) {
+    if (!is_lambda(fn->key_arg_funs[i])) {
+      break;
+    }
+  }
+  if (i < fn->nkey_args) {
+    fn->key_arg_funs = (term *)lisp_alloc(sizeof(term) * fn->nkey_args, NULL);
+    for (i = 0; i < fn->nkey_args; ++i) {
+      term ll_fn = enclosed->key_arg_funs[i];
+      if (is_lambda(ll_fn)) {
+        fn->key_arg_funs[i] = ll_fn;
+      } else if (!eq(car(ll_fn), g_make_closure)) {
+        SIGNAL_INTERNAL_ERROR();
+      } else {
+        fn->key_arg_funs[i] = make_ll_closure(term_to_lambda(cadr(ll_fn)), env);
+      }
+    }
+  }
+  return gen_closure_trampoline(fn, enclosed, env);
+}
+
+//===================================================================
+// Native code generator AMD x86_64 processor
+//===================================================================
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void gen_helper_call_0(Dst_DECL, const void * fn) {
+  // call-rel fn
+  | call &fn;
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void gen_helper_call_1(Dst_DECL, const void * fn, long arg1) {
+  | mov dword [esp], arg1;
+  gen_helper_call_0(Dst, fn);
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void gen_call_function(Dst_DECL, const void * bcode) {
+  if (bcode != NULL) {
+    gen_helper_call_0(Dst, bcode);
+    return;
+  }
+  // recursive function call
+  | call ->entry_point;
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void alloc_temp_var(frame_t * env) {
+  env->temp_var_id += 1;
+  if (env->temp_var_id > env->temp_vars_count) {
+    env->temp_vars_count = env->temp_var_id;
+  }
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void release_temp_var_to_eax(Dst_DECL, frame_t * env) {
+  // relased variable is stored in EAX register
+  env->temp_var_id -= 1;
+  uint32_t temp_var_offset = (C_ARGS_RESERVED + env->max_call_frame_size + env->temp_var_id) * sizeof(term);
+  | mov eax, [esp + temp_var_offset];
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void release_temp_var_to_ecx(Dst_DECL, frame_t * env) {
+  // relased variable is stored in ECX register
+  env->temp_var_id -= 1;
+  uint32_t temp_var_offset = (C_ARGS_RESERVED + env->max_call_frame_size + env->temp_var_id) * sizeof(term);
+  | mov ecx, [esp + temp_var_offset];
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void release_temp_var_to_first_arg(Dst_DECL, frame_t * env) {
+  // relased variable is stored as first argument for helper call
+  env->temp_var_id -= 1;
+  uint32_t temp_var_offset = (C_ARGS_RESERVED + env->max_call_frame_size + env->temp_var_id) * sizeof(term);
+  | mov eax, [esp + temp_var_offset];
+  | mov [esp], eax;
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void release_temp_var_to_second_arg(Dst_DECL, frame_t * env) {
+  // relased variable is stored in RSI register
+  env->temp_var_id -= 1;
+  uint32_t temp_var_offset = (C_ARGS_RESERVED + env->max_call_frame_size + env->temp_var_id) * sizeof(term);
+  | mov eax, [esp + temp_var_offset];
+  | mov [esp + 4], eax;
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void gen_save_eax_and_clear_values(Dst_DECL, term is_tail) {
+  if (!is_null(is_tail)) {
+    | push eax;
+    gen_helper_call_0(Dst, __vm_clear_values);
+    | pop eax;
+  }
+}
+
+//------------------------------------------------------------------------------
+// internal function
+// emits code into body section
+//------------------------------------------------------------------------------
+static void gen_bc_rec(cc_state_t * state, Dst_DECL, term x, op_dest_e dest,
+                       term tags, uint32_t var_idx, frame_t * env) {
+  if (!is_cons(x)) {
+  gen_literal:
+    switch (dest) {
+    case none_e:
+      break;
+    case val_reg_e:
+    case local_var_e:
+    case param_var_e:
+    case call_param_e:
+      | mov eax, x;
+      goto store_val_reg_in_dest;
+      break;
+    }
+    return;
+  }
+
+  term op = car(x);
+  term args = cdr(x);
+
+  if (eq(op, g_quote)) {        // (QUOTE exp)
+    x = car(args);
+    goto gen_literal;
+  }
+
+  if (eq(op, g_progn)) {        // (PROGN ...)
+    term rest;
+    while (is_cons(rest = cdr(args))) {
+      gen_bc_rec(state, Dst, car(args), none_e, tags, -1, env);
+      args = rest;
+    }
+    gen_bc_rec(state, Dst, car(args), dest, tags, var_idx, env);
+    return;
+  }
+
+  if (eq(op, g_if)) {           // (IF cond true-clause false-clause)
+    unsigned false_label = my_dasm_alloc_label(Dst, env);
+    unsigned end_label = my_dasm_alloc_label(Dst, env);
+    // compile condition
+    gen_bc_rec(state, Dst, car(args), val_reg_e, tags, -1, env);
+    // add jmp_false_op instruction
+    | cmp eax, nil;
+    | je =>false_label;
+    // compile true clause
+    gen_bc_rec(state, Dst, cadr(args), dest, tags, var_idx, env);
+    // add jmp_op to skip false clause
+    | jmp =>end_label;
+    // compile false clause
+    |=>false_label:
+    gen_bc_rec(state, Dst, caddr(args), dest, tags, var_idx, env);
+    |=>end_label:
+    return;
+  }
+
+  if (eq(op, g_let)) {          // (LET vars-offset bindings ...)
+    uint32_t vars_offset = term_to_uint32(car(args));
+    term bindings = cadr(args);
+    term body = cddr(args);
+    while (!is_null(bindings)) {
+      gen_bc_rec(state, Dst, car(bindings), local_var_e, tags, vars_offset++, env);
+      bindings = cdr(bindings);
+    }
+    term rest;
+    while (is_cons(rest = cdr(body))) {
+      gen_bc_rec(state, Dst, car(body), none_e, tags, -1, env);
+      body = rest;
+    }
+    gen_bc_rec(state, Dst, car(body), dest, tags, var_idx, env);
+    return;
+  }
+
+  if (eq(op, g_local_var_ref)) {  // (LOCAL-VAR-REF src_offset)
+    switch (dest) {
+    case none_e:
+      break;
+    case val_reg_e:
+    case local_var_e:
+    case param_var_e:
+    case call_param_e:
+      {
+        uint32_t src_offset = term_to_uint32(car(args)) * sizeof(term);
+        | mov eax, [edi + src_offset];
+        // proceed destination
+        goto store_val_reg_in_dest;
+      }
+      break;
+    }
+    return;
+  }
+
+  if (eq(op, g_param_var_ref)) {  // (PARAM-VAR-REF src_offset)
+    switch (dest) {
+    case none_e:
+      break;
+    case val_reg_e:
+    case local_var_e:
+    case param_var_e:
+    case call_param_e:
+      {
+        uint32_t src_offset = term_to_uint32(car(args)) * sizeof(term);
+        | mov eax, [esi + src_offset];
+        // proceed destination
+        goto store_val_reg_in_dest;
+      }
+      break;
+    }
+    return;
+  }
+
+  if (eq(op, g_local_var_set)) {  // (LOCAL-VAR-SET offset value)
+    // evaluate value
+    gen_bc_rec(state, Dst, cadr(args), val_reg_e, tags, -1, env);
+    // generate code to store value in local variable
+    uint32_t offset = term_to_uint32(car(args)) * sizeof(term);
+    | mov [edi + offset], eax;
+    // proceed destination
+  store_val_reg_in_dest:
+    switch (dest) {
+    case none_e:
+    case val_reg_e:
+      break;
+    case local_var_e:
+      {
+        uint32_t frame_offset = var_idx * sizeof(term);
+        | mov [edi + frame_offset], eax;
+      }
+      break;
+    case param_var_e:
+      {
+        uint32_t frame_offset = var_idx * sizeof(term);
+        | mov [esi + frame_offset], eax;
+      }
+      break;
+    case call_param_e:
+      {
+        uint32_t param_offset = (C_ARGS_RESERVED + var_idx) * sizeof(term);
+        | mov [esp + param_offset], eax
+      }
+      break;
+    }
+    return;
+  }
+
+  if (eq(op, g_param_var_set)) {  // (PARAM-VAR-SET offset value)
+    // evaluate value
+    gen_bc_rec(state, Dst, cadr(args), val_reg_e, tags, -1, env);
+    // generate code to store value in parameter variable
+    uint32_t offset = term_to_uint32(car(args)) * sizeof(term);
+    | mov [esi + offset], eax
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_dynamic_ref)) {  // (DYNAMIC-REF sym)
+    term sym = car(args);
+    gen_helper_call_1(Dst, vm_get_dynamic, sym);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_dynamic_set)) {  // (DYNAMIC-SET sym val)
+    term sym = car(args);
+    term val = cadr(args);
+    // evaluate value
+    gen_bc_rec(state, Dst, val, val_reg_e, tags, -1, env);
+    | mov dword [esp], sym
+    | mov [esp + 4], eax;
+    gen_helper_call_0(Dst, vm_set_dynamic);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_deep_ref)) {     // (DEEP-REF frame offset)
+    long nframe = term_to_long(car(args));
+    long src_offset = sizeof(closure_env_t) + term_to_long(cadr(args)) * sizeof(term);
+    assert(nframe >= 1);
+    if (!env->create_environment) {
+      --nframe;
+      if (nframe == 0) {
+        switch (dest) {
+        case none_e:
+          break;
+        case val_reg_e:
+        case local_var_e:
+        case param_var_e:
+        case call_param_e:
+          | mov eax, [ebx + src_offset];
+          // proceed destination
+          goto store_val_reg_in_dest;
+          break;
+        }
+        return;
+      }
+    }
+    switch (dest) {
+    case none_e:
+      break;
+    case val_reg_e:
+    case local_var_e:
+    case param_var_e:
+    case call_param_e:
+      {
+        | mov edx, ebx;
+        long i;
+        for (i = 0; i < nframe; ++i) {
+          | mov edx, [edx];
+        }
+        // now EDX contains pointer to required frame
+        | mov eax, [edx + src_offset];
+        // proceed destination
+        goto store_val_reg_in_dest;
+      }
+      break;
+    }
+    return;
+  }
+
+  if (eq(op, g_deep_set)) {     // (DEEP-SET frame offset val)
+    long nframe = term_to_long(car(args));
+    long offset = sizeof(closure_env_t) + term_to_long(cadr(args)) * sizeof(term);
+    assert(nframe >= 1);
+    // evaluate value
+    gen_bc_rec(state, Dst, caddr(args), val_reg_e, tags, -1, env);
+    // generate code to store value in closed frame
+    if (!env->create_environment) {
+      --nframe;
+      if (nframe == 0) {
+        | mov [ebx + offset], eax
+        // proceed destination
+        goto store_val_reg_in_dest;
+      }
+    }
+    | mov edx, ebx;
+    long i;
+    for (i = 0; i < nframe; ++i) {
+      | mov edx, [edx];
+    }
+    // now EDX contains pointer to required frame
+    | mov [edx + offset], eax
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_tagbody)) {      // (TAGBODY ...)
+    term body = args;
+    // append all tags
+    while (!is_null(body)) {
+      term exp = car(body);
+      if (!is_cons(exp)) {
+        // expression is tag - assign dynamic label
+        term lbl = __long_to_fixnum_term(my_dasm_alloc_label(Dst, env));
+        tags = cons(cons(exp, lbl), tags);
+      }
+      body = cdr(body);
+    }
+    // compile body
+    body = args;
+    while (!is_null(body)) {
+      term exp = car(body);
+      if (is_cons(exp)) {
+        gen_bc_rec(state, Dst, exp, none_e, tags, -1, env);
+      } else {
+        // expression is tag
+        term tag_def = tags;
+        // find tag definition
+        while (!is_null(tag_def)) {
+          term t = car(tag_def);
+          if (eql(exp, car(t))) {
+            tag_def = t;
+            break;
+          }
+          tag_def = cdr(tag_def);
+        }
+        // set dynamic label for the tag
+        unsigned lbl = term_to_uint(cdr(tag_def));
+        |=>lbl:
+      }
+      body = cdr(body);
+    }
+    // clear values
+    gen_helper_call_0(Dst, __vm_clear_values);
+    // Proceed destination: tagbody returns nil
+    gen_bc_rec(state, Dst, nil, dest, tags, var_idx, env);
+    return;
+  }
+
+  if (eq(op, g_go)) {           // (GO tag)
+    term tag = car(args);
+    // find tag
+    while (!is_null(tags)) {
+      term tag_def = car(tags);
+      if (eql(car(tag_def), tag)) {
+        // found tag - jump to it
+        unsigned lbl = term_to_uint(cdr(tag_def));
+        | jmp =>lbl;
+        return;
+      }
+      tags = cdr(tags);
+    }
+    SIGNAL_INTERNAL_ERROR();
+  }
+
+  if (eq(op, g_block)) { // (BLOCK tag-specs usage ...)
+    term tag_spec = car(args);
+    long usage = term_to_long(cadr(args));
+    term body = cddr(args);
+    if (!eq(car(tag_spec), g_local_tag)) {
+      SIGNAL_INTERNAL_ERROR();
+    }
+    // non-catching block
+    unsigned end_lbl = -1;
+    if (usage != 0) {
+      // assign dynamic label
+      end_lbl = my_dasm_alloc_label(Dst, env);
+      tags = cons(cons(LIST_2(g_block, cadr(tag_spec)), __long_to_fixnum_term(end_lbl)), tags);
+    }
+    term rest;
+    while (is_cons(rest = cdr(body))) {
+      gen_bc_rec(state, Dst, car(body), none_e, tags, -1, env);
+      body = rest;
+    }
+    if (usage == 0) {
+      gen_bc_rec(state, Dst, car(body), dest, tags, var_idx, env);
+      return;
+    }
+    gen_bc_rec(state, Dst, car(body), val_reg_e, tags, var_idx, env);
+    // set label to end of block
+    |=>end_lbl:
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_return_from)) {  // (RETURN-FROM tag value)
+    // return from non-catching block
+    term tag = car(args);
+    term value = cadr(args);
+    // find tag
+    term saved_tags = tags;
+    while (!is_null(tags)) {
+      term tag_def = car(tags);
+      term tag_car = car(tag_def);
+      if (is_cons(tag_car) && eq(g_block, car(tag_car)) && eq(tag, cadr(tag_car))) {
+        // found tag
+        // compile value
+        gen_bc_rec(state, Dst, value, val_reg_e, saved_tags, var_idx, env);
+        // jump to end of block
+        unsigned end_lbl = term_to_uint(cdr(tag_def));
+        | jmp =>end_lbl;
+        return;
+      }
+      tags = cdr(tags);
+    }
+    SIGNAL_INTERNAL_ERROR();
+  }
+
+  if (eq(op, g_throw)) { // (THROW tag value)
+    term tg = car(args);
+    term val = cadr(args);
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, tg, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in [ESP + 4]
+    gen_bc_rec(state, Dst, val, val_reg_e, tags, -1, env);
+    | mov [esp + 4], eax;
+    // store first argument from temporary variable
+    release_temp_var_to_first_arg(Dst, env);
+    gen_helper_call_0(Dst, lisp_throw);
+    // lisp_throw is never returns so there is no necessary to store returned value
+    return;
+  }
+
+  if (eq(op, g_call)) {    // (CALL params-offset is-tail fn ...)
+    // Argumens are evaluated from left to right, but passed from right to left
+    uint32_t param_idx = term_to_uint32(car(args));
+    uint32_t params_offset = (C_ARGS_RESERVED + param_idx) * sizeof(term);
+    args = cdr(args);
+    term is_tail = car(args);
+    args = cdr(args);
+    term fn = car(args);
+    args = cdr(args);
+    // compile arguments
+    uint32_t nargs = 0;
+    while (!is_null(args)) {
+      term a = car(args);
+      gen_bc_rec(state, Dst, a, call_param_e, tags, param_idx, env);
+      ++nargs;
+      ++param_idx;
+      args = cdr(args);
+    }
+    // check that number of passed arguments does not exceed Lisp limitations
+    if (nargs >= (INT32_MAX - sizeof(closure_env_t))/sizeof(term)) {
+      compiler_error(state, "too much arguments in function call", long_to_term(nargs));
+    }
+    // compile function call
+    if (is_symbol(fn)) {
+      // clean multiple return values before tail function call
+      if (!is_null(is_tail)) {
+        gen_helper_call_0(Dst, __vm_clear_values);
+      }
+      const symbol_t * s = __term_to_symbol(fn);
+      // setup arguments: nargs, args
+      // first argument: nargs
+      | mov dword [esp], (uint32_t)nargs;
+      // second argument: args
+      | lea eax, [esp + params_offset];
+      | mov [esp + 4], eax;
+      // call function
+      gen_call_function(Dst, symbol_get_ftramp(s));
+    } else if (is_cons(fn)) {
+      // call calculated function
+      // fn is (shallow-ref ...) or (deep-ref ...) or (make-closure ...) or whatever
+      // compile function evaluation
+      if (!is_null(is_tail)) {
+        // store function in temporary variable
+        alloc_temp_var(env);
+        gen_bc_rec(state, Dst, fn, call_param_e, tags,
+                   env->max_call_frame_size + env->temp_var_id - 1, env);
+        // clean multiple return values before tail function call
+        gen_helper_call_0(Dst, __vm_clear_values);
+        // store function (first argument) from temporary variable
+        release_temp_var_to_first_arg(Dst, env);
+      } else {
+        gen_bc_rec(state, Dst, fn, val_reg_e, tags, -1, env);
+        | mov [esp], eax;
+      }
+      // [ESP] now holds evaluated function and multiple values are cleaned if
+      // necessary
+      // get pointer to function_t from term
+      gen_helper_call_0(Dst, term_to_function);
+      // get function_t in EAX
+      | mov eax, [eax + offsetof(function_t, bcode)];
+      // setup arguments: nargs, args. And call function
+      | mov dword [esp], (uint32_t)nargs;
+      | lea ecx, [esp + params_offset];
+      | mov [esp + 4], ecx;
+      | call eax;
+    } else {
+      // function is literal
+      // clean multiple return values before tail function call
+      if (!is_null(is_tail)) {
+        gen_helper_call_0(Dst, __vm_clear_values);
+      }
+      const function_t * lfn = term_to_lambda(fn);
+      // setup arguments: nargs, args
+      | mov dword [esp], (uint32_t)nargs;
+      | lea eax, [esp + params_offset];
+      | mov [esp + 4], eax;
+      // call function
+      gen_call_function(Dst, lfn->bcode);
+    }
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_call_c_fun)) {   // (CALL-C-FUN cfn)
+    lisp_fun_t * cfn = (lisp_fun_t *)term_to_long(car(args));
+    uint32_t nargs = env->lfn->nreq_args + env->lfn->nopt_args + env->lfn->nkey_args;
+    if (env->lfn->has_rest_arg) {
+      ++nargs;
+    }
+    // check that number of passed arguments does not exceed Lisp limitations
+    if (nargs >= (INT32_MAX - sizeof(closure_env_t))/sizeof(term)) {
+      compiler_error(state, "too much arguments in function call", long_to_term(nargs));
+    }
+    // C function call is always tail call, so clean multiple values
+    gen_helper_call_0(Dst, __vm_clear_values);
+    // calculate stack allocation size
+    long alloc_size = nargs * sizeof(term);
+    if (alloc_size > INT32_MAX) {
+      SIGNAL_INTERNAL_ERROR();
+    }
+    // pass arguments through stack
+    while (nargs > 0) {
+      uint32_t offset = (nargs - 1) * sizeof(term);
+      | push dword [esi + offset];
+      --nargs;
+    }
+    // compile function call
+    gen_helper_call_0(Dst, cfn);
+    // clear stack from parameters
+    if (alloc_size != 0) {
+      | add esp, alloc_size;
+    }
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_make_closure)) {    // (MAKE-CLOSURE fn)
+    term fn = car(args);
+    const function_t * lfn = term_to_function(fn);
+    // first arg: function
+    | mov dword [esp], lfn;
+    // second arg: environment
+    | mov [esp + 4], ebx;
+    gen_helper_call_0(Dst, make_closure);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_alloca)) {       // (ALLOCA size-in-terms frame-offset-in-terms)
+    // size is unused under x84_32
+    //    long size = term_to_uint32(car(args));
+    uint32_t frame_offset =  term_to_uint32(cadr(args))  * sizeof(term);
+    | lea eax, [edi + frame_offset];
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_catch_frame_install)) { // (VM-CATCH-FRAME-INSTALL frame tag)
+    term frame = car(args);
+    term tg = cadr(args);
+    // evaluate frame and store in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, frame, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // evaluate tag
+    gen_bc_rec(state, Dst, tg, val_reg_e, tags, -1, env);
+    // store tag in [ESP + 4]
+    | mov [esp + 4], eax;
+    // store evaluated frame from temporary variable in [ESP]
+    release_temp_var_to_first_arg(Dst, env);
+    // call function
+    gen_helper_call_0(Dst, vm_catch_frame_install);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_catch_frame_uninstall)) { // (VM-CATCH-FRAME-UNINSTALL frame value)
+    term frame = car(args);
+    term value = cadr(args);
+    // evaluate frame and store in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, frame, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // evaluate value
+    gen_bc_rec(state, Dst, value, val_reg_e, tags, -1, env);
+    // store value in [ESP + 4]
+    | mov [esp + 4], eax;
+    // store evaluated frame from temporary variable in [ESP]
+    release_temp_var_to_first_arg(Dst, env);
+    // call function
+    gen_helper_call_0(Dst, vm_catch_frame_uninstall);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_get_catch_value)) { // (VM-GET-CATCH-VALUE frame)
+    term frame = car(args);
+    // evaluate frame
+    gen_bc_rec(state, Dst, frame, val_reg_e, tags, -1, env);
+    | mov eax, [eax + offsetof(catch_frame_t, value)];
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_unwind_frame_install)) { // (VM-UNWIND-FRAME-INSTALL frame callback)
+    term frame = car(args);
+    function_t * callback = term_to_lambda(cadr(args));
+    // evaluate frame
+    gen_bc_rec(state, Dst, frame, val_reg_e, tags, -1, env);
+    // first argument - frame
+    | mov [esp], eax;
+    // second argument - callback
+    | mov dword [esp + 4], callback->bcode;
+    // third argument - environment
+    | mov [esp + 8], ebx;
+    // forth argument - pointer to functions arguments
+    | mov [esp + 12], esi;
+    // fifth argument - pointer to local variables
+    | mov [esp + 16], edi;
+    // call function
+    gen_helper_call_0(Dst, vm_unwind_frame_install);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_unwind_frame_uninstall)) { // (VM-UNWIND-FRAME-UNINSTALL value)
+    term value = car(args);
+    // evaluate value
+    gen_bc_rec(state, Dst, value, val_reg_e, tags, -1, env);
+    // first argument
+    | mov [esp], eax;
+    // call function
+    gen_helper_call_0(Dst, vm_unwind_frame_uninstall);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_handler_frame_install)) { // (VM-HANDLER-FRAME-INSTALL frame handler)
+    term frame = car(args);
+    term handler = cadr(args);
+    // evaluate frame and store in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, frame, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // evaluate handler
+    gen_bc_rec(state, Dst, handler, val_reg_e, tags, -1, env);
+    // store handler in [ESP + 4]
+    | mov [esp + 4], eax;
+    // store evaluated frame from temporary variable in [ESP]
+    release_temp_var_to_first_arg(Dst, env);
+    // call function
+    gen_helper_call_0(Dst, vm_handler_frame_install);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_handler_frame_uninstall)) { // (VM-HANDLER-FRAME-UNINSTALL value)
+    term value = car(args);
+    // evaluate frame
+    gen_bc_rec(state, Dst, value, val_reg_e, tags, -1, env);
+    // first argument - frame
+    | mov [esp], eax;
+    // call function
+    gen_helper_call_0(Dst, vm_handler_frame_uninstall);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_sigsetjmp)) {    // (SIGSETJMP catch-frame)
+    term frame = car(args);
+    // evaluate frame
+    gen_bc_rec(state, Dst, frame, val_reg_e, tags, -1, env);
+    // store sigjmp_buf of signal frame in RDI
+    | lea eax, [eax + offsetof(catch_frame_t, sigbuf)];
+    | mov [esp], eax;
+    | mov dword [esp + 4], 0;
+    // call function
+    gen_helper_call_0(Dst, __sigsetjmp);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_set_dynamic_binding)) { // (VM-SET-DYNAMIC-BINDING sym value)
+    term sym = car(args);
+    term val = cadr(args);
+    gen_bc_rec(state, Dst, val, val_reg_e, tags, -1, env);
+    | mov [esp + 4], eax;
+    | mov dword [esp], sym;
+    // call function
+    gen_helper_call_0(Dst, __vm_set_dynamic_binding);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_clear_values)) { // (CLEAR-VALUES &optional res) embedded compiler macro
+    gen_helper_call_0(Dst, __vm_clear_values);
+    if (!is_null(args)) {
+      gen_bc_rec(state, Dst, car(args), dest, tags, var_idx, env);
+    }
+    return;
+  }
+
+  if (eq(op, g_vm_set_new_values)) { // (VM-SET-NEW-VALUES new-values data capacity)
+    term new_values = car(args);
+    term data = cadr(args);
+    uint32_t capacity = term_to_uint32(caddr(args));
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, new_values, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in [ESP + 4]
+    gen_bc_rec(state, Dst, data, val_reg_e, tags, -1, env);
+    | mov [esp + 4], eax;
+    // store first argument from temporary variable
+    release_temp_var_to_first_arg(Dst, env);
+    // Store capacity argument in [ESP + 8]
+    | mov dword [esp + 8], capacity;
+    gen_helper_call_0(Dst, vm_set_new_values);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_advance_values)) { // (VM-ADVANCE-VALUES value)
+    term value = car(args);
+    // evaluate value
+    gen_bc_rec(state, Dst, value, val_reg_e, tags, -1, env);
+    // first argument
+    | mov [esp], eax;
+    // call function
+    gen_helper_call_0(Dst, vm_advance_values);
+    // function does not return value
+    return;
+  }
+
+  if (eq(op, g_vm_call_with_values)) { // (VM-CALL-WITH-VALUES fn new-values-data old-values)
+    term fn = car(args);
+    term new_values_data = cadr(args);
+    term old_values = caddr(args);
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, fn, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, new_values_data, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval third argument and store it in [ESP + 8]
+    gen_bc_rec(state, Dst, old_values, val_reg_e, tags, -1, env);
+    | mov [esp + 8], eax;
+    // store second argument from temporary variable
+    release_temp_var_to_second_arg(Dst, env);
+    // store first argument from temporary variable
+    release_temp_var_to_first_arg(Dst, env);
+    gen_helper_call_0(Dst, vm_call_with_values);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_vm_restore_values)) { // (VM-RESTORE-VALUES old-values)
+    term old_values = car(args);
+    // evaluate old_values
+    gen_bc_rec(state, Dst, old_values, val_reg_e, tags, -1, env);
+    // first argument
+    | mov [esp], eax;
+    // call function
+    gen_helper_call_0(Dst, vm_restore_values);
+    // function does not return value
+    return;
+  }
+
+  if (eq(op, g_vm_set_new_values_bind)) { // (VM-SET-NEW-VALUES-BIND new-values
+                                          // bindings-start bindings-len)
+    term new_values = car(args);
+    uint32_t bindings_offset = term_to_uint32(cadr(args)) * sizeof(term);
+    uint32_t bindings_len = term_to_uint32(caddr(args));
+    // evaluate new_values
+    gen_bc_rec(state, Dst, new_values, val_reg_e, tags, -1, env);
+    // first argument
+    | mov [esp], eax;
+    // second argument - values data
+    | lea eax, [edi + bindings_offset];
+    | mov [esp + 4], eax;
+    // third argument - values capacity
+    | mov dword [esp + 8], bindings_len;
+    // call function
+    gen_helper_call_0(Dst, vm_set_new_values);
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  // Proceed embedded compiler macros
+  if (eq(op, g_eq)) {    // (EQ is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in EAX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    // store first argument from temporary variable in RCX
+    release_temp_var_to_ecx(Dst, env);
+    // x in ECX, and y in EAX
+    | cmp eax, ecx;
+    | mov eax, nil;
+    | mov ecx, g_true;
+    | cmove eax, ecx
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_zerop)) {    // (ZEROP is-tail x) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    gen_bc_rec(state, Dst, x, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    unsigned call_zerop_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_zerop_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_zerop_lbl;
+    | cmp eax, __long_to_fixnum_term(0);
+    | mov eax, nil;
+    | mov ecx, g_true;
+    | cmove eax, ecx;
+    |=>exit_zerop_lbl:
+    // Generate call of zerop in unliked section
+    | .unliked;
+    |=>call_zerop_lbl:
+    | mov [esp], eax;
+    gen_helper_call_0(Dst, zerop);
+    | jmp =>exit_zerop_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_null) ||         // (NULL is-tail x) - embedded compiler macro
+      eq(op, g_not)) {          // (NOT is-tail x) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    gen_bc_rec(state, Dst, x, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    | cmp eax, nil;
+    | mov eax, nil;
+    | mov ecx, g_true;
+    | cmove eax, ecx;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_one_minus)) {    // (1- is-tail x) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    // if x is fixnum, then performs operation directly.
+    // if x is not fixnum or operation caused overflow, then general function is
+    // called.
+    gen_bc_rec(state, Dst, x, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    unsigned call_one_minus_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_one_minus_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned fix_eax_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_one_minus_lbl;
+    | sub eax, 2;
+    | jo =>fix_eax_lbl;
+    |=>exit_one_minus_lbl:
+    // Generate call of one_minus in unliked section
+    | .unliked;
+    |=>fix_eax_lbl:
+    | add eax, 2;
+    |=>call_one_minus_lbl:
+    | mov [esp], eax;
+    gen_helper_call_0(Dst, one_minus);
+    | jmp =>exit_one_minus_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_one_plus)) {    // (1+ is-tail x) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    // if x is fixnum, then performs operation directly.
+    // if x is not fixnum or operation caused overflow, then general function is
+    // called.
+    gen_bc_rec(state, Dst, x, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    unsigned call_one_plus_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_one_plus_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned fix_eax_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_one_plus_lbl;
+    | add eax, 2;
+    | jo =>fix_eax_lbl;
+    |=>exit_one_plus_lbl:
+    // Generate call of one_plus in unliked section
+    | .unliked;
+    |=>fix_eax_lbl:
+    | sub eax, 2;
+    |=>call_one_plus_lbl:
+    | mov [esp], eax;
+    gen_helper_call_0(Dst, one_plus);
+    | jmp =>exit_one_plus_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_num_equal)) {     // (%= is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in EAX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    // store first argument from temporary variable in ECX
+    release_temp_var_to_ecx(Dst, env);
+    // x in ECX, and y in EAX
+    unsigned call_lisp_num_equal_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_num_equal_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_num_equal_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_num_equal_internal_lbl;
+    | cmp eax, ecx;
+    | mov eax, g_true;
+    | mov ecx, nil;
+    | cmovne eax, ecx;
+    |=>exit_num_equal_lbl:
+    // Generate call of lisp_num_equal_internal in unliked section
+    | .unliked;
+    |=>call_lisp_num_equal_internal_lbl:
+    | mov [esp], ecx;
+    | mov [esp + 4], eax;
+    gen_helper_call_0(Dst, lisp_num_equal_internal);
+    | jmp =>exit_num_equal_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_num_not_equal)) {     // (%/= is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in EAX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    // store first argument from temporary variable in ECX
+    release_temp_var_to_ecx(Dst, env);
+    // x in ECX, and y in EAX
+    unsigned call_lisp_num_not_equal_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_num_not_equal_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_num_not_equal_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_num_not_equal_internal_lbl;
+    | cmp eax, ecx;
+    | mov eax, g_true;
+    | mov ecx, nil;
+    | cmove eax, ecx;
+    |=>exit_num_not_equal_lbl:
+    // Generate call of lisp_num_not_equal_internal in unliked section
+    | .unliked;
+    |=>call_lisp_num_not_equal_internal_lbl:
+    | mov [esp], ecx;
+    | mov [esp + 4], eax;
+    gen_helper_call_0(Dst, lisp_num_not_equal_internal);
+    | jmp =>exit_num_not_equal_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_num_less)) {     // (%< is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in EAX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    // store first argument from temporary variable in ECX
+    release_temp_var_to_ecx(Dst, env);
+    // x in ECX, and y in EAX
+    unsigned call_lisp_num_less_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_num_less_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_num_less_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_num_less_internal_lbl;
+    | cmp ecx, eax;
+    | mov eax, g_true;
+    | mov ecx, nil;
+    | cmovnl eax, ecx;
+    |=>exit_num_less_lbl:
+    // Generate call of lisp_num_less_internal in unliked section
+    | .unliked;
+    |=>call_lisp_num_less_internal_lbl:
+    | mov [esp], ecx;
+    | mov [esp + 4], eax;
+    gen_helper_call_0(Dst, lisp_num_less_internal);
+    | jmp =>exit_num_less_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_num_less_equal)) {     // (%<= is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in EAX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    // store first argument from temporary variable in ECX
+    release_temp_var_to_ecx(Dst, env);
+    // x in ECX, and y in EAX
+    unsigned call_lisp_num_less_equal_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_num_less_equal_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_num_less_equal_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_num_less_equal_internal_lbl;
+    | cmp ecx, eax;
+    | mov eax, g_true;
+    | mov ecx, nil;
+    | cmovnle eax, ecx;
+    |=>exit_num_less_equal_lbl:
+    // Generate call of lisp_num_less_internal in unliked section
+    | .unliked;
+    |=>call_lisp_num_less_equal_internal_lbl:
+    | mov [esp], ecx;
+    | mov [esp + 4], eax;
+    gen_helper_call_0(Dst, lisp_num_less_equal_internal);
+    | jmp =>exit_num_less_equal_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_num_greater)) {  // (%> is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in EAX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    // store first argument from temporary variable in ECX
+    release_temp_var_to_ecx(Dst, env);
+    // x in ECX, and y in EAX
+    unsigned call_lisp_num_greater_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_num_greater_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_num_greater_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_num_greater_internal_lbl;
+    | cmp ecx, eax;
+    | mov eax, g_true;
+    | mov ecx, nil;
+    | cmovng eax, ecx;
+    |=>exit_num_greater_lbl:
+    // Generate call of lisp_num_less_internal in unliked section
+    | .unliked;
+    |=>call_lisp_num_greater_internal_lbl:
+    | mov [esp], ecx;
+    | mov [esp + 4], eax;
+    gen_helper_call_0(Dst, lisp_num_greater_internal);
+    | jmp =>exit_num_greater_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_num_greater_equal)) { // (%>= is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in EAX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    // store first argument from temporary variable in ECX
+    release_temp_var_to_ecx(Dst, env);
+    // x in ECX, and y in EAX
+    unsigned call_lisp_num_greater_equal_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_num_greater_equal_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_num_greater_equal_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_num_greater_equal_internal_lbl;
+    | cmp ecx, eax;
+    | mov eax, g_true;
+    | mov ecx, nil;
+    | cmovnge eax, ecx;
+    |=>exit_num_greater_equal_lbl:
+    // Generate call of lisp_num_less_internal in unliked section
+    | .unliked;
+    |=>call_lisp_num_greater_equal_internal_lbl:
+    | mov [esp], ecx;
+    | mov [esp + 4], eax;
+    gen_helper_call_0(Dst, lisp_num_greater_equal_internal);
+    | jmp =>exit_num_greater_equal_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_plus)) {     // (%+ is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in EAX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    // store first argument from temporary variable in ECX
+    release_temp_var_to_ecx(Dst, env);
+    // x in ECX, and y in EAX
+    unsigned call_lisp_add_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_add_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned fix_eax_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_add_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_add_internal_lbl;
+    | add eax, ecx;
+    | jo =>fix_eax_lbl;
+    |=>exit_add_lbl:
+    // Generate call of lisp_num_less_internal in unliked section
+    | .unliked;
+    |=>fix_eax_lbl:
+    | sub eax, ecx;
+    |=>call_lisp_add_internal_lbl:
+    | mov [esp], ecx;
+    | mov [esp + 4], eax;
+    gen_helper_call_0(Dst, lisp_add_internal);
+    | jmp =>exit_add_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_mul)) {     // (%* is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in EAX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    // store first argument from temporary variable in ECX
+    release_temp_var_to_ecx(Dst, env);
+    // x in ECX, and y in EAX
+    unsigned call_lisp_mul_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_mul_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned fix_args_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_mul_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_mul_internal_lbl;
+    // save EAX
+    | mov edx, eax;
+    | shr ecx, 1;
+    | imul eax, ecx;
+    | jo =>fix_args_lbl;
+    |=>exit_mul_lbl:
+    // Generate call of lisp_num_less_internal in unliked section
+    | .unliked;
+    |=>fix_args_lbl:
+    | mov eax, edx;
+    | shl ecx, 1;
+    |=>call_lisp_mul_internal_lbl:
+    | mov [esp], ecx;
+    | mov [esp + 4], eax;
+    gen_helper_call_0(Dst, lisp_mul_internal);
+    | jmp =>exit_mul_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_neg)) {        // (neg is-tail x) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    gen_bc_rec(state, Dst, x, val_reg_e, tags, -1, env);
+    // clear values
+    gen_save_eax_and_clear_values(Dst, is_tail);
+    unsigned call_neg_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_neg_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned fix_args_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_neg_lbl;
+    // save eax
+    | mov edx, eax;
+    | neg eax;
+    | jo =>fix_args_lbl;
+    |=>exit_neg_lbl:
+    // Generate call of lisp_num_less_internal in unliked section
+    | .unliked;
+    |=>fix_args_lbl:
+    | mov eax, edx;
+    |=>call_neg_lbl:
+    | mov [esp], eax;
+    gen_helper_call_0(Dst, lisp_neg);
+    | jmp =>exit_neg_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_minus)) {        // (%- is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in RCX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    if (!is_null(is_tail)) {
+      | push eax;
+      gen_helper_call_0(Dst, __vm_clear_values);
+      | pop ecx;
+    } else {
+      | mov ecx, eax;
+    }
+    // store first argument from temporary variable in EAX
+    release_temp_var_to_eax(Dst, env);
+    // x in EAX, and y in ECX
+    unsigned call_lisp_sub_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_sub_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned fix_args_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_sub_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_sub_internal_lbl;
+    | sub eax, ecx;
+    | jo =>fix_args_lbl;
+    |=>exit_sub_lbl:
+    // Generate call of lisp_num_less_internal in unliked section
+    | .unliked;
+    |=>fix_args_lbl:
+    | add eax, ecx;
+    |=>call_lisp_sub_internal_lbl:
+    | mov [esp], eax;
+    | mov [esp + 4], ecx;
+    gen_helper_call_0(Dst, lisp_sub_internal);
+    | jmp =>exit_sub_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  if (eq(op, g_div)) {     // (%div is-tail x y) - embedded compiler macro
+    term is_tail = car(args);
+    term x = cadr(args);
+    term y = caddr(args);
+    // if both x and y are fixnum, then performs operation directly.  if one of
+    // them is not fixnum or operation caused overflow, then general function is
+    // called.
+    // eval first argument and store it in temporary variable
+    alloc_temp_var(env);
+    gen_bc_rec(state, Dst, x, call_param_e, tags,
+               env->max_call_frame_size + env->temp_var_id - 1, env);
+    // eval second argument and store it in RCX
+    gen_bc_rec(state, Dst, y, val_reg_e, tags, -1, env);
+    // clear values
+    if (!is_null(is_tail)) {
+      | push eax;
+      gen_helper_call_0(Dst, __vm_clear_values);
+      | pop ecx;
+    } else {
+      | mov ecx, eax;
+    }
+    // store first argument from temporary variable in EAX
+    release_temp_var_to_eax(Dst, env);
+    // x in EAX, and y in ECX
+    unsigned call_lisp_div_int_internal_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned exit_div_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned do_div_lbl = my_dasm_alloc_label(Dst, env);
+    unsigned div_fixnum_min_by_minus_one_lbl = my_dasm_alloc_label(Dst, env);
+    | test al, 1;
+    | jnz =>call_lisp_div_int_internal_lbl;
+    | test cl, 1;
+    | jnz =>call_lisp_div_int_internal_lbl;
+    | cmp eax, __long_to_fixnum_term(FIXNUM_MIN);
+    | je =>div_fixnum_min_by_minus_one_lbl;
+    |=>do_div_lbl:
+    | xor edx, edx;
+    | idiv ecx;
+    | shl eax, 1;
+    |=>exit_div_lbl:
+    // Generate call of lisp_num_less_internal in unliked section
+    | .unliked;
+    |=>div_fixnum_min_by_minus_one_lbl:
+    | cmp ecx, __long_to_fixnum_term(-1);
+    | jne =>do_div_lbl;
+    | mov eax, g_positive_fixnum_min;
+    | jmp =>exit_div_lbl;
+    |=>call_lisp_div_int_internal_lbl:
+    | mov [esp], eax;
+    | mov [esp + 4], ecx;
+    gen_helper_call_0(Dst, lisp_div_int_internal);
+    | jmp =>exit_div_lbl;
+    // switch back to body section
+    | .body;
+    // proceed destination
+    goto store_val_reg_in_dest;
+  }
+
+  pprint(x, vm_get_dynamic(g_stderr_var));
+  SIGNAL_INTERNAL_ERROR();
+}
+
+//------------------------------------------------------------------------------
+// internal function
+// emits code into prolog section
+//------------------------------------------------------------------------------
+static void gen_fn_prologue_with_environment(const function_t * lfn, Dst_DECL,
+                                             frame_t * env, int check_args) {
+  // setup function environment
+  if (env->is_closure) {
+    // This is closure_type 1 and RAX points on closure function_t object and
+    // not on closure_env_t on function entry.
+    | mov ebx, eax;
+  } else {
+    | xor ebx, ebx;
+  }
+  // prepare arguments for create_environment_rt, this function also checks
+  // arguments and copies them into environment frame
+  // 1st argument - nargs
+  | mov eax, [ebp + 8];
+  | mov [esp], eax;
+  // 2nd argument - args
+  | mov eax, [ebp + 12];
+  | mov [esp + 4], eax;
+  // 3rd argument - pointer to function. if function is not closure, then
+  // pointer is not touched. But pointer should be pached to real function in
+  // case of closure, in order to check_args_rt function will work
+  // correctly. This is closure_type 1 and EBX here points on closure function_t
+  // object and not on closure_env_t on function entry.
+  if (env->is_closure) {
+    | mov [esp + 8], ebx;
+  } else {
+    | mov dword [esp + 8], lfn;
+  }
+  // 4th argument - boolean indicating if arguments checking is necessary
+  if (check_args) {
+    | mov dword [esp + 12], 1;
+  } else {
+    if (lfn->nopt_args != 0 || lfn->has_rest_arg || lfn->nkey_args != 0) {
+      // Only lamba lists functions for calculating optional and key arguments
+      // do not require arguments parser. Compiler generates lambdas with required
+      // arguments only and runtime ensures that number of actual arguments is
+      // equal or more than required.
+      SIGNAL_INTERNAL_ERROR();
+    }
+    | mov dword [esp + 12], 0;
+  }
+  // create environment
+  gen_helper_call_0(Dst, create_environment_rt);
+  | mov ebx, eax;
+  // now EBX contains pointer to closure_env_t
+  // setup arguments pointer - esi
+  if (env->param_vars.size != 0) {
+    | lea esi, [ebx + offsetof(closure_env_t, data)];
+    // setup local variables pointer - edi
+    if (env->local_bind_size != 0) {
+      | lea edi, [esi + env->param_vars.size * sizeof(term)];
+    }
+  } else if (env->local_bind_size != 0) {
+    // setup local variables pointer - edi
+    | lea edi, [ebx + offsetof(closure_env_t, data)];
+  }
+}
+
+//------------------------------------------------------------------------------
+// internal function
+// emits code into prolog section
+//------------------------------------------------------------------------------
+static void gen_fn_prologue_for_opt_rest_key_args(const function_t * lfn, Dst_DECL,
+                                                  frame_t * env, long frame_offset) {
+  // setup function environment
+  if (env->is_closure) {
+    // This is closure_type 1 and EAX points on closure function_t object and
+    // not on closure_env_t on function entry.
+    | mov ebx, eax;
+  }
+  // prepare arguments for check_args_rt, this function also checks
+  // arguments and copies them into environment frame
+  // 1st argument - nargs
+  | mov eax, [ebp + 8];
+  | mov [esp], eax;
+  // 2nd argument - args
+  | mov eax, [ebp + 12];
+  | mov [esp + 4], eax;
+  // 3rd argument - pointer to function is in RDX, which set up in very function
+  // begining. if function is not closure, then pointer is not touched. But for
+  // closure pointer should be pached to real function, in order to check_args_rt
+  // function will work correctly. This is closure_type 1 and RBX here points on
+  // closure function_t object and not on closure_env_t on function entry.
+  if (env->is_closure) {
+    | mov [esp + 8], ebx;
+    // set EBX to point to environment
+    | mov ebx, [ebx + offsetof(function_t, enclosed_env)];
+  } else {
+    | mov dword [esp + 8], lfn;
+  }
+  // 4th argument - pointer to frame
+  // offset of local frame from stack top
+  int32_t local_binds_offset = frame_offset + lfn->frame_size * sizeof(term);
+  | lea eax, [ebp - local_binds_offset];
+  | mov [esp + 12], eax;
+  // 5-th argument - boolean indicating if arguments checking is necessary -
+  // always true, because:
+  // Only lamba lists functions for calculating optional and key arguments
+  // do not require arguments parser. Compiler generates lambdas with required
+  // arguments only and runtime ensures that number of actual arguments is
+  // equal or more than required.
+  | mov dword [esp + 16], 1;
+  // check arguments
+  gen_helper_call_0(Dst, check_args_rt);
+  // now EAX holds pointer to stack frame (returned by check_args_rt)
+  // setup arguments pointer - esi
+  if (env->param_vars.size != 0) {
+    | mov esi, eax;
+    // setup local variables pointer - edi
+    if (env->local_bind_size != 0) {
+      local_binds_offset = env->param_vars.size * sizeof(term);
+      | lea edi, [esi + local_binds_offset];
+    }
+  } else if (env->local_bind_size != 0) {
+    // setup local variables pointer - edi
+    | mov edi, eax;
+  }
+}
+
+//------------------------------------------------------------------------------
+// internal function
+// emits code into prolog section
+//------------------------------------------------------------------------------
+static long gen_fn_prologue(cc_state_t * state, const function_t * lfn, Dst_DECL,
+                            frame_t * env, int check_args, int is_unwind_callback) {
+  // set entry point label
+  |->entry_point:
+  // common prologue
+  | push ebp;
+  | mov ebp, esp;
+  // setup function pointer
+  | push lfn;
+  long frame_offset = 4;        // function frame offset from %EBP register
+  if (is_unwind_callback || env->create_environment || env->is_closure) {
+    | push ebx;
+    frame_offset += 4;
+  }
+  if (is_unwind_callback || env->param_vars.size != 0) {
+    | push esi;
+    frame_offset += 4;
+  }
+  if (is_unwind_callback || env->local_bind_size != 0) {
+    | push edi;
+    frame_offset += 4;
+  }
+  // setup stack allocation size
+  long alloc_size = (env->max_call_frame_size + C_ARGS_RESERVED) * sizeof(term);
+  if (!is_unwind_callback && !env->create_environment) {
+    alloc_size += env->local_bind_size * sizeof(term);
+    if (lfn->nopt_args != 0 || lfn->has_rest_arg || lfn->nkey_args != 0) {
+      alloc_size += env->param_vars.size * sizeof(term);
+    }
+  }
+  if (env->temp_vars_count != 0) {
+    alloc_size += env->temp_vars_count * sizeof(term);
+  }
+  if (alloc_size != 0) {
+    // allocate stack frame
+    | sub esp, alloc_size;
+  }
+  if (is_unwind_callback) {
+    | mov ebx, [ebp +  8];
+    | mov esi, [ebp +  12];
+    | mov edi, [ebp +  16];
+    return alloc_size;
+  }
+  if (env->create_environment) {
+    gen_fn_prologue_with_environment(lfn, Dst, env, check_args);
+    return alloc_size;
+  }
+  if (lfn->nopt_args != 0 || lfn->has_rest_arg || lfn->nkey_args != 0) {
+    if (!check_args) {
+      // Only lamba lists functions for calculating optional and key arguments
+      // do not require arguments parser. Compiler generates lambdas with required
+      // arguments only and runtime ensures that number of actual arguments is
+      // equal or more than required.
+      SIGNAL_INTERNAL_ERROR();
+    }
+    gen_fn_prologue_for_opt_rest_key_args(lfn, Dst, env, frame_offset);
+    return alloc_size;
+  }
+  // Generate prologue for function with required arguments only.
+  // Generate error handler for invalid arguments count in unlikely code
+  // setup function environment
+  if (env->is_closure) {
+    | mov ebx, eax;
+  }
+  // Switch to unliked section
+  | .unliked;
+  |->signal_invalid_args_count:
+  | mov dword[esp], g_invalid_args_count;
+  | mov eax, [ebp +  8];
+  | mov [esp + 4], eax;
+  gen_helper_call_0(Dst, lisp_signal);
+  // Switch back to prolog section
+  | .prolog;
+  // Generate code for validating arguments
+  | cmp dword [ebp +  8], lfn->nreq_args;
+  if (check_args) {
+    // check exactly
+    | jne ->signal_invalid_args_count;
+  } else {
+    // check minimal amount
+    | jb ->signal_invalid_args_count;
+  }
+  // setup esi and edi
+  if (env->local_bind_size != 0) {
+    // setup local variables pointer
+    // offset of local frame from stack top
+    int32_t local_binds_offset = frame_offset + env->local_bind_size * sizeof(term);
+    | lea edi, [ebp - local_binds_offset];
+  }
+  if (env->param_vars.size != 0) {
+    // setup arguments pointer
+    | mov esi, [ebp +  12];
+  }
+  return alloc_size;
+}
+
+//------------------------------------------------------------------------------
+// internal function
+// emits code into epilog section
+//------------------------------------------------------------------------------
+static void gen_fn_epilogue(cc_state_t * state, const function_t * lfn, Dst_DECL,
+                            frame_t * env, long alloc_size, int is_unwind_callback) {
+  // free stack frame
+  if (alloc_size != 0) {
+    | add esp, alloc_size;
+  }
+  // restore registers
+  if (is_unwind_callback || env->local_bind_size != 0) {
+    // restore local variables pointer
+    | pop edi;
+  }
+  if (is_unwind_callback || env->param_vars.size != 0) {
+    // restore arguments pointer
+    | pop esi;
+  }
+  if (is_unwind_callback || env->create_environment || env->is_closure) {
+    // restore function environment
+    | pop ebx;
+  }
+  // generate function exit
+  | leave;
+  | ret;
+}
+
+//------------------------------------------------------------------------------
+// internal function
+//------------------------------------------------------------------------------
+static void generate_function_bytecode(cc_state_t * state, function_t * lfn, term body,
+                                       frame_t * env, int check_args, int is_unwind_callback) {
+  if (env->param_vars.size >= (INT32_MAX - sizeof(closure_env_t))/sizeof(term) ||
+      env->local_bind_size >= (INT32_MAX - sizeof(closure_env_t))/sizeof(term) ||
+      env->param_vars.size + env->local_bind_size >= (INT32_MAX - sizeof(closure_env_t))/sizeof(term)) {
+    compiler_error(state, "function frame size is too big",
+                   cons(long_to_term(env->param_vars.size), long_to_term(env->local_bind_size)));
+  }
+  lfn->frame_size = env->param_vars.size + env->local_bind_size;
+  if (env->is_closure &&
+      (env->create_environment || lfn->nopt_args != 0 || lfn->has_rest_arg || lfn->nkey_args != 0)) {
+    lfn->closure_type = 1;
+  }
+  dasm_State * dstate;
+  Dst_DECL = &dstate;
+  dasm_init(Dst, DASM_MAXSECTION);
+  void* global_labels[DASM_GLOB__MAX];
+  dasm_setupglobal(Dst, global_labels, DASM_GLOB__MAX);
+  dasm_setup(Dst, g_dasm_actionlist);
+  void * old_bcode = lfn->bcode;
+  lfn->bcode = NULL;            // for recursive self calls
+  // generate function body
+  env->lfn = lfn;
+  | .body
+  gen_bc_rec(state, Dst, body, val_reg_e, nil, -1, env);
+  // generate function prologue
+  | .prolog
+  long alloc_size = gen_fn_prologue(state, lfn, Dst, env, check_args, is_unwind_callback);
+  // generate function epilogue
+  | .epilog
+  gen_fn_epilogue(state, lfn, Dst, env, alloc_size, is_unwind_callback);
+  // Finish code generation
+  my_dasm_finish(Dst, lfn, old_bcode);
+}
+
+//------------------------------------------------------------------------------
+// internal function
+// generates code for parsing arguments for C function and then calling C function.
+//------------------------------------------------------------------------------
+static void generate_c_function_bytecode(cc_state_t * state, function_t * lfn,
+                                         const void * cfn, frame_t * env) {
+  generate_function_bytecode(state, lfn, LIST_2(g_call_c_fun, long_to_term((long)cfn)),
+                             env, 1, 0);
+}

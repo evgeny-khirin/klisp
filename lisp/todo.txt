@@ -1,0 +1,274 @@
+* write specs, docs and complete lisp library functions
+
+* select minimal set of functions and features of KLisp. That will be core of
+  language. The core may be opened source with dual license. All other features
+  will be implemented as libraries - free or commercial.
+
+* re-design symbol resolution protocol and packages. Ensure that it works such
+  close to Common Lisp as possible.
+
+* add "~p" specifier to printf function - print cons in dotted notation:
+  "(x . y)". For proper list '(a b c) it will be printed as '(a . (b c)).
+
+* add new builtin type - "sensitive". It is wrapper for other regular terms and
+  must prevent accidental leaks of sensitive private information to logs,
+  terminal printings etc. For example, the string containing e-mail of customer
+  is sensitive information and appearring it in logs is privacy leak. So
+  function:
+    (mask-sensitive obj) ==> sensitive
+  will return object which is wrapper for sensitive information. And if
+  sensitive object will be printed as (print sensitive-object), then output will
+  be like: #<sensitive type: 0x78F788788>. All core functions must handle new
+  type. Operations with sensitive-objects must produce sensitive objects. For
+  example, substring from sensitive string will return new sensitive
+  object. Containers like conses and vectors may be sensitive as well. So
+  functions returning part or element of sensitive container must wrap it by
+  sensitive object.
+
+* allow heap grow in GC.
+
+* ensure that GC cleans memory with bzero on allocation, in order to prevent
+  security leaks in multiuser server application. Probably, based on value of
+  dynamic variable.
+
+* Add hygienic macros in addition to usual macros. Add define-syntax and
+  syntax-rules support.
+  See:
+  http://community.schemewiki.org/?hygiene-versus-gensym
+  http://www.ccs.neu.edu/home/dorai/mbe/mbe-lsp.html
+
+* replace boolean flags in terms, like immutable, by bit fields.
+
+* make function __deep_immune_literals public.
+
+* add option to lock core native functions. It is for sake of performance of
+  native code. For example, C code may call 'car(x)' function directly, it it is
+  locked. Otherwise, it should do: FUNCALL(symbol_function(g_car), x).
+
+* rename embedded compiler macros like 'kl:eq to private like 'kl::%eq. And
+  compiler macros that translate '(kl:eq x y) to '(kl::%eq x y). Probably, will
+  not be necessary, if lock of core functions will be added.
+
+* re-design multiple values support. Add special handling of values member of
+  vm_t in GC. So it will not be necessary to clean up whole array.
+
+* test klisp performance vs ccl
+    (defun tst ()
+      (mapcar
+        (lambda (X) (cons (car X) (reverse (delete (car X) (cdr X)))))
+        '((a b c a b c) (b c d b c d) (c d e c d e) (d e f d e f))))
+
+    CL-USER> (time (dotimes (i 1000000) (tst)))
+    (DOTIMES (I 1000000) (TST))
+    took 692,000 microseconds (0.692000 seconds) to run.
+          67,967 microseconds (0.067967 seconds, 9.82%) of which was spent in
+    GC.
+    During that period, and with 4 available CPU cores,
+         671,875 microseconds (0.671875 seconds) were spent in user mode
+               0 microseconds (0.000000 seconds) were spent in system mode
+     384,000,064 bytes of memory allocated.
+    NIL
+
+* test klisp performance vs ccl
+    CL-USER> (defvar x 1)
+    X
+    CL-USER>  (time (dotimes (i 10000) (eval '((lambda (x) (+ x x)) x))))
+    (DOTIMES (I 10000) (EVAL '((LAMBDA (X) (+ X X)) X)))
+    took 2,820,878 microseconds (2.820878 seconds) to run.
+           117,355 microseconds (0.117355 seconds, 4.16%) of which was spent in
+    GC.
+    During that period, and with 4 available CPU cores,
+         2,816,176 microseconds (2.816176 seconds) were spent in user mode
+            20,002 microseconds (0.020002 seconds) were spent in system mode
+     158,734,624 bytes of memory allocated.
+     248 minor page faults, 0 major page faults, 0 swaps.
+    NIL
+
+* complete AVL trees implementation.
+
+* add TST (ternary search trees). Use AVL as binary tree inside of TST.
+  Replace prefix trees (tries) by TST.
+
+* add inheritance to structures. Store list of structure fields in properties of
+  structure symbol name.
+
+* add with-struct macro, which will generate macros like "var.field" for
+  accessing struct fields and "set-var.field" for setting field value.
+
+* add :debug attribute to structure declarartions. In that case, structure
+  vector will contain structure name as first element and structure macros will
+  ensure that object is indeed structure.
+
+* redesign GC. It should be precise, mostly copying, generational GC (see below
+  for alternatives):
+  1. Each pointer must have marker function, which marks objects for GC. If
+     pointer is part of some structure, than its marker will be NULL and pointer
+     will be marked by main structure marker function.
+  2. Pointers, which reside on thread stacks and CPU registers are pinned and
+     not moved during GC (stacks and registers are scanned conservatively). If
+     pinned pointer does not have marker function, and is not marked by other
+     markers, then it is scanned conservatively.
+  3. Global nursery size is equal to last CPU level cache starting from level 3
+     and below. For example, if level-3 and level-2 are presented, then level-3
+     size is selected as size of global nursery.
+  4. Thread's nursery size should be equal to size of level-1 data cache.
+  5. This design of GC is good for green threads, which are scheduled by few
+     native threads (one per CPU) and GC is performed on level of native
+     threads.
+
+* another approach is generational conservative GC:
+  1. Nursery size is configurable, default is 1M.
+  2. Pointers array is divided in two spaces: gen-0 and gen-1. Both are reside
+     in same array, but on different sides: gen-0 is in begining and gen-1 is in
+     end. When array is full it is rellocated and gen-1 are moved to new location.
+  3. Nursery is not continued, but calculated, i.e. when nursery size is
+     allocated, then GC is performed. Allocated size is reset after each GC.
+  4. Additional bits array is used to mark dirty pages in gen-1. It is cleared
+     after each GC.
+  5. Pointers in gen-1 and static C variables are considered as roots in
+     GC. They are scaned only when corresponded memory page is modified. In
+     order to detect memory modification, static C variables and memory pages
+     pointed by gen-1 pointers are protected by read-only.
+  6. Only stack, registers and modified roots are scaned during generational
+     GC. The scan should be restricted to detect and mark gen-0 pointers
+     only. Marked gen-0 pointers are added to scanner also.
+  7. Then survived pointers from gen-0 should be added to gen-1. But only
+     pointers that point to half and more full pages are added to gen-1.
+  8. Then all newly added pages and modified root pages are re-protected to be
+     read only.
+  9. GC is finished.
+
+* add copy-on-write feature to binaries - two or more different binaries objects
+  will share same data buffer. Function binary-copy will mark original
+  binary as copy-on-write and return new binary, which is also marked as
+  copy-on-write. Function subbinary will also produce copy-on-write binary
+  object.
+
+* Invoke GC not when pointers array is filled, but when size of allocated memory
+  is almost equal to size of CPU's level 2 cache.
+
+* divide lisp_alloc into two APIS: lisp_malloc and lisp_calloc, and carefully
+  port the code.
+
+* add libmicrohttpd integration.
+
+* add hashmap for storing Lisp data associated microhttpd connection.
+
+* consider porting of libmicrohttpd to Lisp.
+
+* port current http server to use binaries instead of symbols like :GET,
+  :HTTP/1.1 etc.
+
+* consider to remove printf and error helper members from vm_t structure. Use
+  stack allocated buffers instead.
+
+* add pthread rwlock object to lisp and evaluate its performance.
+
+* add mutex or rwlock to hashmap and hashmap_lock hashmap_unlock functions and
+  with-hashmap-lock macro.
+
+* use locks when modifying or reading HTTP server hosts and URLs.
+
+* write http server
+
+* rewrite lisp using void * for term (use casting to uintptr_t for bits
+  manipulations) and INTPTR_MIN and INTPTR_MAX for fixnum boundaries. Use size_t
+  for sizes and capacities of containers objects. Ensure that
+  sizeof(size_t) <= sizeof(uintptr_t).
+
+* add curl support
+
+* add DLL support to Lisp.
+
+* Add print method for custom objects. Improve printing of custom objects.
+
+* add messaging to threads using message queues (mqueue.h) or pipies. Check what
+  is faster.
+
+* improve errors reporting with 'error' function: (error label fmt-str &rest args).
+
+* Consider to extend 'declare' support to 'let, 'let*, 'multiple-value-bind etc.
+  Common Lisp:
+  http://www.lispworks.com/documentation/lw51/CLHS/Body/s_declar.htm
+
+* optimize standard functions with &optional and &key arguments using compiler
+  macros. For example, (intern name &key (package *package*) exported), may be
+  optimized as following using internal function (%intern name package exported).
+
+  (defun intern (name &key (package *package*) exported)
+    (%intern name package exported))
+
+  (define-compiler-macro intern (name &key (package '*package*) exported)
+    `(%intern ,name ,package ,exported))
+
+  It may be done automatically for new functions defined with 'defun macro.
+
+  Main problem with such optimization is in cases when name of key argument is
+  evaluated in runtime in function invocation. It may be fixed by more complex
+  compiler macro with argument analysis or syntax of function invocation with
+  &key arguments should be limited.
+
+* Add 'destructuring-bind' macro and support of destructuring lambda lists in
+  defmacro.
+
+* recosider to redesign multiple return values using single values array in vm_t,
+  instead of allocating them on stack.
+
+* add support for containers operations with vargs, like:
+  (vector-assign seq ...), (vector-append-many seq ...), (vector-insert-many seq pos ...) etc.
+
+* add locale functions and character conversions by iconv.
+
+* performance of echo-server with native threads is pure and unstable.
+  See, may be help:
+  http://urbanairship.com/blog/2010/09/29/linux-kernel-tuning-for-c500k/
+  http://urbanairship.com/blog/2010/08/24/c500k-in-action-at-urban-airship/
+
+* consider green threads support. It may improve GC collector performance,
+  because native thread suspending may be expensive. Other alternative is usage
+  of libevent library or something similiar. BTW green threads may be
+  implemented with libevent library.
+
+* Finish character support:
+  1. UTF-32 character syntax.
+  2. Fix ustring_icmp: use libunistring functions.
+  3. Fix Unicode classification functions: toupper etc., use libunistring.
+  4. Add multibyte and UTF-8 functions.
+  4. Add type, syntax and functions for UTF-16.
+
+* write macroexpand-all function
+
+* add print callback to custom datatypes
+
+* improve compiler checks for correct syntax and errors reporting.
+
+* add KDB to lisp
+
+* add SQL basic statements
+
+* create emaxdb service
+
+* create function database, which will be used to print call stack. Every
+  function will place its pointer on stack in prologue. And print routine will
+  look up function pointers in DB. Add top stack field in vm_t, which will be
+  set in thread_start. Replace handler-case with handler-bind, which will be
+  called before stack unwinding, in order to be able to print call stack.
+
+* review 'go', 'return-from' special forms, which transfer controll outside of
+  'handler-bind' and 'unwind-protect' special forms. It is not necessary to
+  translate them into 'catch/throw' pair, just restore virtual machine frames
+  before transfer control.
+
+* add support of positional parameters in lisp_printf: %m$ and *m$.
+
+* add optimization of flet and labels by substitution of their invocation by literal
+  lambdas, which latter will be expanded into let.
+
+* add compiler macros for binaries, string and vectors set and get operations.
+
+* add compiler macros: rem, band, bor, bxor, bnot, bshl, bshr
+
+* improve code generator in x86_64 and i386 when offset of local variable or
+  parameter is 0, generate shorter commands like:
+    498B06                          mov rax, [r14]
+    8906                            mov [esi], eax

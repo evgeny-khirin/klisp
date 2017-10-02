@@ -34,6 +34,7 @@
 * Since it does not have make file, you'll need Erlang to build the compiler. There is
   build.erl file in root directory. It is my replacement of make, written in Erlang.
   You need to start Erlang in the root directory:
+  
       evgeny@wheezy:~/work/klisp$ erl
       Erlang/OTP 17 [erts-6.2] [source] [async-threads:10] [kernel-poll:false]
 
@@ -41,7 +42,9 @@
       1> c("build.erl").
       {ok,build}
       2> build:compile().
+      
 After that you'll have K-Lisp build in lisp/tests directory:
+
       evgeny@wheezy:~/work/klisp$ ./lisp/tests/klisp.release
       kl> (load "lisp/boot.lisp")
 

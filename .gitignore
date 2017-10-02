@@ -2,6 +2,5 @@
 *.d
 lisp/obj
 lisp/tests
-3rd_party/*
 lisp/eval_x86_64_linux.c.h
 lisp/eval_x86_32_linux.c.h

@@ -28,6 +28,8 @@
 
 # Building
 
+* OS supported: Linux 32 and 64 bits.
+
 * Prerequirements. You need Lua with bitops library. You need Capstone dissassembling
   library, resides under 3rd_party/ durectory.
 

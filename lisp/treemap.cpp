@@ -6,9 +6,9 @@
 /// Author  : Evgeny Khirin <>
 /// Description : Erlios Lisp treemap, based on STL map.
 ///-------------------------------------------------------------------
-#include "klisp.h"
-
 #include <map>
+
+#include "klisp.h"
 
 //-------------------------------------------------------------------
 // Maps term to term

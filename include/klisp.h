@@ -153,7 +153,6 @@ INLINE term __long_to_fixnum_term(long x);
 // Exceptions list
 //------------------------------------------------------------------------------
 #define EXCEPTIONS_LIST                                              \
-  DEF_EXCEPTION(not_implemented)                                     \
   DEF_EXCEPTION(internal_error)                                      \
   DEF_EXCEPTION(max_alloc_size_exceeded)                             \
   DEF_EXCEPTION(out_of_memory)                                       \
@@ -219,19 +218,17 @@ void lisp_error_sz(term label, const char * fmt, ...) __attribute__ ((__noreturn
 // INTERNAL_ERROR macro
 //-------------------------------------------------------------------
 #define SIGNAL_INTERNAL_ERROR(fmt, ...)                                 \
-  lisp_error_sz(g_internal_error, "Internal error (%s:%d): " fmt,       \
-                __FILE__, __LINE__, ## __VA_ARGS__)
+  lisp_error_sz(g_internal_error, "Internal error (%s:%s:%d): " fmt,    \
+                __func__, __FILE__, __LINE__, ## __VA_ARGS__)
 
-  //#define SIGNAL_INTERNAL_ERROR(...) __SIGNAL_INTERNAL_ERROR(__VA_ARGS__)
+//#define SIGNAL_INTERNAL_ERROR(...) __SIGNAL_INTERNAL_ERROR(__VA_ARGS__)
 
 //-------------------------------------------------------------------
 // NOT_IMPLEMENTED macro
 //-------------------------------------------------------------------
 #define SIGNAL_NOT_IMPLEMENTED()                                        \
-  lisp_signal(g_not_implemented,                                        \
-              cons(make_binary_from_binary((const uint8_t *)__FILE__,   \
-                                           sizeof(__FILE__) - 1),       \
-                   __long_to_fixnum_term(__LINE__)))
+  lisp_error_sz(g_internal_error, "Internal error (%s:%s:%d): not implemented",    \
+                __func__, __FILE__, __LINE__)
 
 //-------------------------------------------------------------------
 // TRACE
@@ -321,18 +318,12 @@ INLINE int is_number(term x) {
 //------------------------------------------------------------------------------
 // Internal function: converts C pointer to Lisp object
 //------------------------------------------------------------------------------
-// INLINE term __pointer_to_term(const void * x) {
-//   if (((long)x & 7) != 0) {
-//     SIGNAL_INTERNAL_ERROR();
-//   }
-//   return (term)x | (term)7;
-// }
-#define __pointer_to_term(x)    (assert(((long)(x) & 7) == 0), (term)(x) | (term)7)
+#define __pointer_to_term(x) (assert(((long)(x) & 7) == 0), (term)(x) | (term)7)
 
 //------------------------------------------------------------------------------
 // Internal function: converts Lisp object to C pointer
 //------------------------------------------------------------------------------
-#define __term_to_pointer(x)    (void *)((x) ^ (term)7)
+#define __term_to_pointer(x) (void *)((x) ^ (term)7)
 
 //==============================================================================
 // Fixnums
@@ -1361,35 +1352,29 @@ INLINE void ustring_immune(const ustring_t * v) {
 //------------------------------------------------------------------------------
 // Calculates new capacity for array based data types
 //------------------------------------------------------------------------------
-INLINE long __calc_new_capacity(long size, long capacity, long max_capacity,
-                                long delta) {
-  if (delta > max_capacity - size) {
+INLINE long __calc_new_capacity(long capacity, long max_capacity, long capacity_delta) {
+  if (capacity_delta > max_capacity - capacity) {
     lisp_signal(g_out_of_capacity, __long_to_fixnum_term(max_capacity));
   }
-  long new_capacity;
-  if (delta >= capacity) {
-    new_capacity = capacity + delta + (delta >> 1);
-  } else {
-    // Use geometric grow for capacities below 32 elements and fibonachi like
-    // grow for higher capacities
-    if (capacity < 32) {
-      new_capacity = capacity + capacity;
-    } else {
-      new_capacity = capacity + (capacity >> 1);
-    }
+  if (capacity >= max_capacity >> 1) {
+    return max_capacity;
   }
-  if (new_capacity > max_capacity) {
-    new_capacity = max_capacity;
+  if (capacity_delta >= capacity) {
+    return capacity + capacity_delta;
   }
-  assert(new_capacity - size >= delta);
-  return new_capacity;
+  // Use geometric grow for capacities below 32 elements and fibonachi like
+  // grow for higher capacities
+  if (capacity < 32) {
+    return capacity + capacity;
+  }
+  return capacity + (capacity >> 1);
 }
 
 //------------------------------------------------------------------------------
 // ustring_ensure_capacity
 //------------------------------------------------------------------------------
-INLINE void __ustring_realloc(ustring_t * v, long delta) {
-  long new_capacity = __calc_new_capacity(v->size, v->capacity, v->max_capacity, delta);
+INLINE void __ustring_realloc(ustring_t * v, long capacity_delta) {
+  long new_capacity = __calc_new_capacity(v->capacity, v->max_capacity, capacity_delta);
   if (v->data == NULL) {
     v->data = (uint32_t *)lisp_alloc_atomic(new_capacity * sizeof(uint32_t), NULL);
   } else {
@@ -1902,8 +1887,8 @@ INLINE void binary_immune(const binary_t * v) {
 //------------------------------------------------------------------------------
 // binary_ensure_capacity
 //------------------------------------------------------------------------------
-INLINE void __binary_realloc(binary_t * v, long delta) {
-  long new_capacity = __calc_new_capacity(v->size, v->capacity, v->max_capacity, delta);
+INLINE void __binary_realloc(binary_t * v, long capacity_delta) {
+  long new_capacity = __calc_new_capacity(v->capacity, v->max_capacity, capacity_delta);
   if (v->data == NULL) {
     v->data = (uint8_t *)lisp_alloc_atomic(new_capacity, NULL);
   } else {
@@ -2930,8 +2915,8 @@ INLINE void vector_immune(const vector_t * v) {
 //------------------------------------------------------------------------------
 // vector_ensure_capacity
 //------------------------------------------------------------------------------
-INLINE void __vector_realloc(vector_t * v, long delta) {
-  long new_capacity = __calc_new_capacity(v->size, v->capacity, v->max_capacity, delta);
+INLINE void __vector_realloc(vector_t * v, long capacity_delta) {
+  long new_capacity = __calc_new_capacity(v->capacity, v->max_capacity, capacity_delta);
   if (v->data == NULL) {
     v->data = (term *)lisp_alloc(new_capacity * sizeof(term), NULL);
   } else {

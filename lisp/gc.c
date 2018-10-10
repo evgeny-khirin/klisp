@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <semaphore.h>
+#include <signal.h>
 
 //------------------------------------------------------------------------------
 // GC signals

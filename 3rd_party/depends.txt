@@ -1,2 +1,6 @@
 1. DynASM module of LuaJIT version 2.0.3+: http://luajit.org/dynasm.html
-2. Capstone disassembling library version 3.0.2+: http://www.capstone-engine.org/
+   Requires also following packages (Debian/Ubuntu): lua5.1, lua-bitops
+2. Capstone disassembling library version 3.0.2+:
+   http://www.capstone-engine.org/
+   Debian/Ubuntu package: libcapstone-dev > 3.0.2
+3. Also requires following Debian/Ubuntu packages: libunistring-dev,

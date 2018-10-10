@@ -140,8 +140,8 @@ compile_cpp(File, CustOpts, debug) ->
         end,
     Compiler =
         case filename:extension(File) of
-            ".cpp" -> "g++";
-            ".c"   -> "gcc"
+            ".cpp" -> "g++-6";
+            ".c"   -> "gcc-6"
         end,
     case is_c_file_changed(Target, DepFile) of
         true ->
@@ -169,8 +169,8 @@ compile_cpp(File, CustOpts, release) ->
         end,
     Compiler =
         case filename:extension(File) of
-            ".cpp" -> "g++";
-            ".c"   -> "gcc"
+            ".cpp" -> "g++-6";
+            ".c"   -> "gcc-6"
         end,
     case is_c_file_changed(Target, DepFile) of
         true ->

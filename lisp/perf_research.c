@@ -238,7 +238,11 @@ void test_gc() {
   // malloc
   timer_value(&start);
   for (i = 0; i < SMALL_LOOPS; ++i) {
-    malloc(sizeof(cons_t));
+    // Pointer p is declared and used here in order to fix error:
+    // ignoring return value of malloc, declared with attribute
+    // warn_unused_result [-Werror=unused-result]
+    void * p = malloc(sizeof(cons_t));
+    (void)p;
   }
   timer_value(&end);
   printf("malloc time %g sec, throughput %g million ops/sec\n",

@@ -2824,6 +2824,23 @@ function on block-oriented streams."
     (vector-set v new-idx tmp)))
   v)
 
+;;---------------------------------------------------------------------------
+;; to-base-36
+;;---------------------------------------------------------------------------
+(defun to-base-36 (x)
+  (if (zerop x)
+      (binary #"0")
+      (let ((m "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            (r (binary)))
+        (if (< x 0)
+            (progn
+              (binary-append-char r #"-")
+              (setq x (neg x))))
+        (while (not (zerop x))
+          (binary-append-char r (binary-ref m (rem x 36)))
+          (setq x (div x 36)))
+        (binary-reverse r))))
+
 ;;--------------------------------------------------------------------------
 ;; end
 ;;--------------------------------------------------------------------------

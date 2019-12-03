@@ -1,3 +1,11 @@
+# autoreconf
+build-aux/
+Makefile
+Makefile.in
+aclocal.m4
+autom4te.cache/
+
+
 TAGS
 *.beam
 *.d

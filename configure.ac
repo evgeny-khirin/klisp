@@ -4,7 +4,7 @@
 AC_PREREQ([2.69])
 AC_INIT([klisp], [0.1])
 AC_CONFIG_SRCDIR([lisp/init.c])
-AC_CONFIG_HEADERS([config.h])
+AC_CONFIG_HEADERS([include/config.h])
 
 AC_CONFIG_AUX_DIR([build-aux])
 
@@ -21,7 +21,7 @@ AC_PROG_RANLIB
 
 # Checks for libraries.
 AC_CHECK_LIB([unistring], [u32_check])
-AC_CHECK_LIB([gmp], [mpz_init])
+AC_CHECK_LIB([gmp], [mpz_add_ui])
 AC_CHECK_LIB([pthread], [pthread_mutex_lock])
 
 AC_SEARCH_LIBS([cs_disasm], [capstone], [], [

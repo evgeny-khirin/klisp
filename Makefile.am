@@ -1,7 +1,10 @@
-CFLAGS=-D_LARGEFILE64_SOURCE -D_GNU_SOURCE -D __STDC_LIMIT_MACROS -D __STDC_CONSTANT_MACROS \
+CFLAGS=
+CXXFLAGS=
+
+MY_CFLAGS=-D_LARGEFILE64_SOURCE -D_GNU_SOURCE -D __STDC_LIMIT_MACROS -D __STDC_CONSTANT_MACROS \
 	-Wall -Werror
 
-CXXFLAGS=-D_LARGEFILE64_SOURCE -D_GNU_SOURCE -D __STDC_LIMIT_MACROS -D __STDC_CONSTANT_MACROS \
+MY_CXXFLAGS=-D_LARGEFILE64_SOURCE -D_GNU_SOURCE -D __STDC_LIMIT_MACROS -D __STDC_CONSTANT_MACROS \
 	-Wall -Werror
 
 lisp/eval.c: lisp/eval_x86_32_linux.c.h lisp/eval_x86_64_linux.c.h
@@ -14,8 +17,8 @@ lisp/eval_x86_64_linux.c.h: lisp/eval_x86_64_linux.c.h.dasc
 
 bin_PROGRAMS = klisp.release klisp.debug
 
-klisp_release_CFLAGS=$(CFLAGS) -O3 -fno-strict-aliasing
-klisp_release_CXXFLAGS=$(CXXFLAGS) -O3 -fno-strict-aliasing
+klisp_release_CFLAGS=$(MY_CFLAGS) -O3 -fno-strict-aliasing
+klisp_release_CXXFLAGS=$(MY_CXXFLAGS) -O3 -fno-strict-aliasing
 
 klisp_release_SOURCES = \
 	lisp/avlmap.c \
@@ -43,7 +46,7 @@ klisp_release_SOURCES = \
 	lisp/treemap.cpp \
 	lisp/vector.cpp
 
-klisp_debug_CFLAGS=$(CFLAGS) -O0 -g
-klisp_debug_CXXFLAGS=$(CXXFLAGS) -O0 -g
+klisp_debug_CFLAGS=$(MY_CFLAGS) -O0 -g
+klisp_debug_CXXFLAGS=$(MY_CXXFLAGS) -O0 -g
 
 klisp_debug_SOURCES = $(klisp_release_SOURCES)

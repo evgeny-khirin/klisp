@@ -19,14 +19,14 @@ AC_PROG_LN_S
 AC_PROG_MAKE_SET
 AC_PROG_RANLIB
 
-# Checks for libraries.
-AC_CHECK_LIB([unistring], [u32_check])
-AC_CHECK_LIB([gmp], [mpz_add_ui])
-AC_CHECK_LIB([pthread], [pthread_mutex_lock])
+# Checks LUA
+AX_PROG_LUA
 
-AC_SEARCH_LIBS([cs_disasm], [capstone], [], [
-  AC_MSG_ERROR([unable to find libcapstone3])
-	])
+# Checks for libraries.
+AC_CHECK_LIB([unistring], [u32_check], [],  [AC_MSG_ERROR([unistring library not found])])
+AC_CHECK_LIB([pthread], [pthread_mutex_lock], [],  [AC_MSG_ERROR([pthread library not found])])
+AC_CHECK_LIB([gmp], [__gmpz_init], [],  [AC_MSG_ERROR([gmp library not found])])
+AC_CHECK_LIB([capstone], [cs_disasm], [],  [AC_MSG_ERROR([capstone3 library not found])])
 
 # Checks for header files.
 AC_FUNC_ALLOCA

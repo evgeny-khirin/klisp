@@ -23,29 +23,24 @@
 * K-Lisp supports both lexical and dynamic variables binding. It has separate
   syntax for lexical and dynamic binding. All global variables are dynamically
   bound, while function parameters and local variables are lexically bound.
-  
+
 * More dateiled specs are in docs/specs.txt.
 
 # Building
 
 * OS supported: Linux 32 and 64 bits.
-
-* Prerequirements. You need Lua with bitops library. You need Capstone ver.3.0+ dissassembling
-  library, resides under 3rd_party/ durectory.
-
+* Prerequirements. You need Lua with bitops library. You need Capstone ver.3.0+ dissassembling library, resides under 3rd_party/ durectory.
 * GNU autotools 2.69+
-
 * Then run following commands:
-    ./autogen.sh
-    ./configure
-    make
 
+      ./autogen.sh
+      ./configure
+      make
 * After that you'll have both debug and release executables of K-Lisp in current directory:
+
       evgeny@wheezy:~/work/klisp$ ./klisp.release
       kl> (load "lisp/boot.lisp")
-
       :ok
       kl> "Hello, world!"
-
       "Hello, world!"
       kl>

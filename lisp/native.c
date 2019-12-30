@@ -5267,6 +5267,28 @@ static term lisp_sleep(term milliseconds) {
 }
 
 //------------------------------------------------------------------------------
+// Function: (describe-errno) ==> string
+//------------------------------------------------------------------------------
+static term lisp_describe_errno(term errnum) {
+  long err = term_to_long(errnum);
+  char buf[128];
+  const char * p = buf;
+#ifdef _GNU_SOURCE
+  p = strerror_r(err, buf, sizeof(buf));
+#elif defined _POSIX_SOURCE
+  {
+    int rc = strerror_r(err, buf, sizeof(buf));
+    if (rc != 0) {
+      lisp_signal(g_system_error, long_to_term(rc));
+    }
+  }
+#else
+#error "Nor _GNU_SOURCE or _POSIX_SOURCE macros are provided"
+#endif
+  return make_binary_from_sz(p);
+}
+
+//------------------------------------------------------------------------------
 // Internal function
 //------------------------------------------------------------------------------
 void __native_init() {
@@ -5676,6 +5698,7 @@ void __native_init() {
   make_global_c_lambda("(kl:setenv name value overwrite)", lisp_setenv, 1);
   make_global_c_lambda("(kl:unsetenv name)", lisp_unsetenv, 1);
   make_global_c_lambda("(kl:clearenv)", lisp_clearenv, 1);
+  make_global_c_lambda("(kl:describe-errno errno)", lisp_describe_errno, 1);
 
   // FUNCTIONS
   make_global_c_lambda("(kl:function-lambda-list fn)", lisp_function_lambda_list, 1);

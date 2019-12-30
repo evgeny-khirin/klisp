@@ -19,8 +19,8 @@ AC_PROG_LN_S
 AC_PROG_MAKE_SET
 AC_PROG_RANLIB
 
-# Checks LUA
-AX_PROG_LUA
+# Checks LUA, ensure that under Ubuntu "autoconf-archive" package is installed
+AX_PROG_LUA([5.1], [], [], [AC_MSG_ERROR([LUA 5.1+ not found])])
 
 # Checks for libraries.
 AC_CHECK_LIB([unistring], [u32_check], [],  [AC_MSG_ERROR([unistring library not found])])

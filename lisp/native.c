@@ -5910,6 +5910,7 @@ void __native_init() {
   // RESOLVER
   make_global_c_lambda("(kl:gethostbyname name &optional (address-family AF_INET))",
                        lisp_gethostbyname, 1);
+  make_global_c_lambda("(kl:gethostname)", lisp_gethostname, 1);
 
   // SOCKETS
   make_global_c_lambda("(kl:socket-close socket)", socket_close, 1);

@@ -72,6 +72,17 @@ term lisp_gethostbyname(term name, term addr_family) {
   return make_binary_from_sz(buf);
 }
 
+//------------------------------------------------------------------------------
+// Function: (gethostname) ==> string
+//------------------------------------------------------------------------------
+term lisp_gethostname() {
+  char name[HOST_NAME_MAX + 1];
+  if (gethostname(name, sizeof(name)) != 0) {
+    lisp_signal_system_error();
+  }
+  return make_binary_from_sz(name);
+}
+
 //==============================================================================
 // SOCKETS
 //==============================================================================

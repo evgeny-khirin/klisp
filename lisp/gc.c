@@ -678,3 +678,89 @@ long gc_ptrs_capacity() {
 long gc_heap_size() {
   return g_heap_size;
 }
+
+//------------------------------------------------------------------------------
+// Allocates memory from heap and checks parameters and return value.
+// Allocated memory may contain pointers. Block of memory may be
+// reallocated.
+//------------------------------------------------------------------------------
+void * lisp_alloc(unsigned long size, finalizer_t fn) {
+  if (size > MAX_ALLOC) {
+    lisp_signal(g_max_alloc_size_exceeded, __ulong_to_bigint_term(size));
+  }
+  void * r = gc_alloc(size, fn, 0);
+  if (r == NULL) {
+    lisp_signal(g_out_of_memory, __long_to_fixnum_term(size));
+  }
+  assert(((long)r & 7) == 0);
+  return r;
+}
+
+//------------------------------------------------------------------------------
+// Allocates memory from heap and checks parameters and return value
+// Allocated memory can not contain pointers. Block of memory may be
+// reallocated.
+//------------------------------------------------------------------------------
+void * lisp_alloc_atomic(unsigned long size, finalizer_t fn) {
+  if (size > MAX_ALLOC) {
+    lisp_signal(g_max_alloc_size_exceeded, __ulong_to_bigint_term(size));
+  }
+  void * r = gc_alloc(size, fn, 1);
+  if (r == NULL) {
+    lisp_signal(g_out_of_memory, __long_to_fixnum_term(size));
+  }
+  assert(((long)r & 7) == 0);
+  return r;
+}
+
+//------------------------------------------------------------------------------
+// Reallocates pointer, previosly allocated with lisp_alloc
+//------------------------------------------------------------------------------
+void * lisp_realloc(void * p, unsigned long old_size, unsigned long new_size) {
+  if (new_size == 0) {
+    return NULL;
+  }
+  if (new_size > MAX_ALLOC) {
+    lisp_signal(g_max_alloc_size_exceeded, __ulong_to_bigint_term(new_size));
+  }
+  void * r = gc_alloc(new_size, NULL, 0);
+  if (r == NULL) {
+    lisp_signal(g_out_of_memory, __long_to_fixnum_term(new_size));
+  }
+  assert(((long)r & 7) == 0);
+  memcpy(r, p, old_size);
+  return r;
+}
+
+//------------------------------------------------------------------------------
+// Reallocates pointer, previosly allocated with lisp_alloc_atomic
+//------------------------------------------------------------------------------
+void * lisp_realloc_atomic(void * p, unsigned long old_size, unsigned long new_size) {
+  if (new_size == 0) {
+    return NULL;
+  }
+  if (new_size > MAX_ALLOC) {
+    lisp_signal(g_max_alloc_size_exceeded, __ulong_to_bigint_term(new_size));
+  }
+  void * r = gc_alloc(new_size, NULL, 1);
+  if (r == NULL) {
+    lisp_signal(g_out_of_memory, __long_to_fixnum_term(new_size));
+  }
+  assert(((long)r & 7) == 0);
+  memcpy(r, p, old_size);
+  return r;
+}
+
+//------------------------------------------------------------------------------
+// Allocates executable memory from heap and checks parameters and return value.
+//------------------------------------------------------------------------------
+void * lisp_alloc_executable(unsigned long size) {
+  return lisp_alloc_atomic(size, NULL);
+}
+
+//------------------------------------------------------------------------------
+// Reallocates pointer, previosly allocated with lisp_alloc_executable
+//------------------------------------------------------------------------------
+void * lisp_realloc_executable(void * p, unsigned long old_size, unsigned long new_size) {
+  return lisp_realloc_atomic(p, old_size, new_size);
+}

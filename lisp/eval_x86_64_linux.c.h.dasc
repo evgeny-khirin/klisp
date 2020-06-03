@@ -1818,7 +1818,7 @@ static long gen_fn_prologue(cc_state_t * state, const function_t * lfn, Dst_DECL
   | mov rbp, rsp;
 #ifdef DEBUG
   // check RSP aligment
-  | test esp, 0x0F;
+  | test rsp, 0x0F;
   | jnz ->signal_stack_alignment;
   // Switch to unliked section
   | .unliked;

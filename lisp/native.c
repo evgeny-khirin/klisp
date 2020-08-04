@@ -2487,7 +2487,7 @@ static term gensym(term x) {
 }
 
 //------------------------------------------------------------------------------
-// Function: (intern name &optional (package *package*) exported) ==> symbol
+// Function: (intern name &key (package *package*) exported) ==> symbol
 //------------------------------------------------------------------------------
 term intern(term name, term package, term exported) {
   switch (get_term_type(package)) {

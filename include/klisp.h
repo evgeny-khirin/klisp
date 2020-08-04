@@ -3690,7 +3690,7 @@ struct symbol_t {
                                 // from collecting by GC
   term            name;
   term            package;      // package where symbol is interned. If symbol
-                                // is not interned, than package is nil
+                                // is not interned, then package is nil
   term            value;
   term            fun;
   term            plist;

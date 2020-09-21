@@ -1,7 +1,7 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
-AC_PREREQ([2.69])
+AC_PREREQ([2.63])
 AC_INIT([klisp], [0.1])
 AC_CONFIG_SRCDIR([lisp/init.c])
 AC_CONFIG_HEADERS([include/config.h])
@@ -20,11 +20,12 @@ AC_PROG_MAKE_SET
 AC_PROG_RANLIB
 
 # Checks LUA, ensure that under Ubuntu "autoconf-archive" package is installed
-AX_PROG_LUA([5.1], [], [], [AC_MSG_ERROR([LUA 5.1+ not found])])
+#AX_PROG_LUA([5.1], [], [], [AC_MSG_ERROR([LUA 5.1+ not found])])
 
 # Checks for libraries.
 AC_CHECK_LIB([unistring], [u32_check], [],  [AC_MSG_ERROR([unistring library not found])])
 AC_CHECK_LIB([pthread], [pthread_mutex_lock], [],  [AC_MSG_ERROR([pthread library not found])])
+AC_CHECK_LIB([rt], [clock_gettime], [],  [AC_MSG_ERROR([rt library not found])])
 AC_CHECK_LIB([gmp], [__gmpz_init], [],  [AC_MSG_ERROR([gmp library not found])])
 AC_CHECK_LIB([capstone], [cs_disasm], [],  [AC_MSG_ERROR([capstone3 library not found])])
 
@@ -33,7 +34,7 @@ AC_FUNC_ALLOCA
 AC_CHECK_HEADERS([arpa/inet.h fcntl.h float.h inttypes.h limits.h locale.h netdb.h netinet/in.h stddef.h stdint.h stdlib.h string.h strings.h sys/socket.h sys/time.h unistd.h wchar.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
-AC_CHECK_HEADER_STDBOOL
+#AC_CHECK_HEADER_STDBOOL
 AC_C_INLINE
 AC_TYPE_INT16_T
 AC_TYPE_INT32_T

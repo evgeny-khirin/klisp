@@ -1,3 +1,25 @@
+(time (let ((mutex (mutex-create)))
+        (dotimes (i 1000000)
+          (with-mutex-lock (mutex) nil)))
+      :ops 1000000
+      :name "mutex lock/unlock single thread")
+
+(let (threads
+      (mutex (mutex-create)))
+  (time (progn
+          (dotimes (i os:CPU-ONLINE-COUNT)
+            (push (thread-create (lambda ()
+                                   (dotimes (i 1000000)
+                                     (with-mutex-lock (mutex) nil)))
+                                 nil
+                                 :detached nil
+                                 :suppress-closure-warning t)
+                  threads))
+          (dolist (thr threads)
+            (thread-join thr)))
+        :ops (* os:CPU-ONLINE-COUNT 1000000)
+        :name "mutex lock/unlock in threads"))
+
 (time (dotimes (i 1000000)
         (symbol-create "abc"))
       :ops 1000000

@@ -1383,7 +1383,7 @@ Measures time of expression execution and prints it to *stdout*."
                   (,gc-end (gc-time))
                   (,run-time (/ (- ,end ,start) 1000))
                   (,gc-time (- ,gc-end ,gc-start)))
-             (printf "\n~aun time ~f sec, GC time ~f sec (~f%)~a"
+             (printf "\n~aun time ~f sec, GC time ~f sec (~f%)~a\n"
                      ,(if name (binary name ": r") "R")
                      ,run-time ,gc-time (* (/ ,gc-time ,run-time) 100)
                      (%time-throughput ,ops ,run-time))
@@ -1393,7 +1393,7 @@ Measures time of expression execution and prints it to *stdout*."
                 (,res (multiple-value-list ,exp))
                 (,end (clock-time-msec CLOCK_MONOTONIC))
                 (,run-time (/ (- ,end ,start) 1000)))
-             (printf "\n~aun time ~f sec~a"
+             (printf "\n~aun time ~f sec~a\n"
                      ,(if name (binary name ": r") "R")
                      ,run-time (%time-throughput ,ops ,run-time))
              (apply 'values ,res)))))
